@@ -7,6 +7,16 @@ GitHub Action that reviews pull requests with [Codex CLI](https://github.com/ope
 
 Works with OpenAI directly or any OpenAI-compatible endpoint.
 
+## Why
+
+Codex has a built-in GitHub review (`@codex review`), but it needs a ChatGPT plan and runs on OpenAI only. [`openai/codex-action`](https://github.com/openai/codex-action) runs Codex in CI, but posting results back to the PR is up to you.
+
+This action fills that gap:
+
+- Bring your own **API key and provider** (OpenAI, OpenRouter, LiteLLM, self-hosted, ...), including `chat` wire API.
+- Inline comments with suggestions are posted out of the box, no extra scripting.
+- Findings follow a fixed JSON schema, so the output format stays consistent.
+
 ## Usage
 
 ```yaml
@@ -45,14 +55,14 @@ Checkout requirements:
 
 ## Inputs
 
-| Name | Default | Description |
-|------|---------|-------------|
-| `api-key` | — | API key for the model provider (required) |
-| `base-url` | `https://api.openai.com/v1` | OpenAI-compatible base URL, without `/responses` |
-| `model` | Codex default | Model name |
-| `wire-api` | `responses` | `responses` or `chat` |
-| `codex-version` | `0.160.1` | `@openai/codex` npm version |
-| `github-token` | `github.token` | Token used to post the review |
+| Name            | Default                     | Description                                      |
+| --------------- | --------------------------- | ------------------------------------------------ |
+| `api-key`       | —                           | API key for the model provider (required)        |
+| `base-url`      | `https://api.openai.com/v1` | OpenAI-compatible base URL, without `/responses` |
+| `model`         | Codex default               | Model name                                       |
+| `wire-api`      | `responses`                 | `responses` or `chat`                            |
+| `codex-version` | `0.160.1`                   | `@openai/codex` npm version                      |
+| `github-token`  | `github.token`              | Token used to post the review                    |
 
 ## Project context
 
