@@ -1,0 +1,108 @@
+name: Codex PR Review
+description: Review pull requests with Codex CLI and post inline comments with suggestions
+author: mercenarioZ
+
+branding:
+  icon: eye
+  color: purple
+
+inputs:
+  api-key:
+    description: API key for the model provider
+    required: true
+  base-url:
+    description: OpenAI-compatible base URL (without /responses)
+    required: false
+    default: https://api.openai.com/v1
+  model:
+    description: Model name; empty uses the Codex default
+    required: false
+    default: ""
+  wire-api:
+    description: Provider API style, "responses" or "chat"
+    required: false
+    default: responses
+  codex-version:
+    description: "@openai/codex npm version"
+    required: false
+    default: 0.160.1
+  github-token:
+    description: Token used to post the review
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+
+    - name: Install Codex CLI
+      shell: bash
+      env:
+        CODEX_VERSION: ${{ inputs.codex-version }}
+      run: npm i -g "@openai/codex@$CODEX_VERSION"
+
+    - name: Configure provider
+      shell: bash
+      env:
+        BASE_URL: ${{ inputs.base-url }}
+        MODEL: ${{ inputs.model }}
+        WIRE_API: ${{ inputs.wire-api }}
+      run: |
+        mkdir -p ~/.codex
+        {
+          if [ -n "$MODEL" ]; then echo "model = \"$MODEL\""; fi
+          cat <<EOF
+        model_provider = "proxy"
+
+        [model_providers.proxy]
+        name = "Codex provider"
+        base_url = "$BASE_URL"
+        env_key = "CODEX_REVIEW_API_KEY"
+        wire_api = "$WIRE_API"
+        EOF
+        } > ~/.codex/config.toml
+
+    - name: Allow sandbox user namespaces
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+    - name: Run review
+      shell: bash
+      env:
+        CODEX_REVIEW_API_KEY: ${{ inputs.api-key }}
+        BASE_REF: ${{ github.base_ref }}
+      run: |
+        git diff "origin/$BASE_REF...HEAD" > pr.diff
+        codex exec --sandbox read-only \
+          --output-schema "$GITHUB_ACTION_PATH/schema.json" \
+          --output-last-message review.json \
+          "$(cat "$GITHUB_ACTION_PATH/prompt.md")"
+
+    - name: Post review
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        jq --arg sha "$HEAD_SHA" '
+          def icon: {critical:"🔴",major:"🟠",minor:"🟡",nit:"🔵"}[.];
+          {
+            commit_id: $sha,
+            event: "COMMENT",
+            body: .summary,
+            comments: [.findings[] | {
+              path, line, side: "RIGHT",
+              body: ((.severity|icon) + " **" + (.severity|ascii_upcase) + "** · " + .title
+                     + "\n\n" + .body
+                     + (if .suggestion != "" then "\n\n```suggestion\n" + .suggestion + "\n```" else "" end))
+            } + (if .start_line < .line then {start_line, start_side: "RIGHT"} else {} end)]
+          }' review.json > payload.json
+
+        gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --input payload.json \
+          || gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(jq -r .summary review.json)"
