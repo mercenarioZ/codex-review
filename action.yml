@@ -26,10 +26,23 @@ inputs:
     description: "@openai/codex npm version"
     required: false
     default: 0.160.1
+  incremental:
+    description: Review only commits pushed since the last review; falls back to the full PR diff
+    required: false
+    default: "true"
+  resolve-fixed:
+    description: Resolve previous review threads whose finding is fixed (needs contents write)
+    required: false
+    default: "true"
   github-token:
     description: Token used to post the review
     required: false
     default: ${{ github.token }}
+
+outputs:
+  ai-prompt:
+    description: Prompt for an AI coding agent covering this review's findings (empty when nothing was reviewed)
+    value: ${{ steps.post.outputs.ai-prompt }}
 
 runs:
   using: composite
@@ -70,19 +83,132 @@ runs:
       shell: bash
       run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
+    - name: Determine review range
+      id: range
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        BASE_REF: ${{ github.base_ref }}
+        INCREMENTAL: ${{ inputs.incremental }}
+      run: |
+        if [ -z "$HEAD_SHA" ] || [ -z "$PR_NUMBER" ]; then
+          echo "::warning::codex-review skipped: no pull_request payload (got event '${{ github.event_name }}')"
+          echo "skip=1" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        from=$(git merge-base "origin/$BASE_REF" "$HEAD_SHA" 2>/dev/null \
+          || git rev-parse --verify --quiet "origin/$BASE_REF^{commit}" || true)
+        if [ -z "$from" ]; then
+          echo "::error::codex-review cannot resolve base 'origin/$BASE_REF'; the checkout needs fetch-depth: 0 and the base branch"
+          exit 1
+        fi
+        if [ "$INCREMENTAL" = "true" ]; then
+          gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+            --jq '.[] | select(.body | contains("codex-review:head=")) | .body | @base64' \
+            > reviews.b64 2>/dev/null || true
+          if [ -s reviews.b64 ]; then
+            # one line per review; the reviews API is chronological, so the last line is the newest review
+            tail -1 reviews.b64 | base64 -d \
+              | sed '/<!-- ai-prompt:start -->/,/<!-- ai-prompt:end -->/d' > prev-review.md
+            last=$(grep -o 'codex-review:head=[0-9a-f]\{40\}' prev-review.md | cut -d= -f2 | tail -1 || true)
+            if [ -n "$last" ] && git cat-file -e "$last^{commit}" 2>/dev/null \
+              && git merge-base --is-ancestor "$last" "$HEAD_SHA"; then
+              from="$last"
+            fi
+          fi
+        fi
+
+        echo "from=$from" >> "$GITHUB_OUTPUT"
+        if [ "$from" = "$HEAD_SHA" ]; then
+          echo "skip=1" >> "$GITHUB_OUTPUT"
+          echo "already reviewed $HEAD_SHA, nothing to do"
+          exit 0
+        fi
+
+        git diff "$from" "$HEAD_SHA" > pr.diff
+        if [ ! -s pr.diff ]; then
+          echo "skip=1" >> "$GITHUB_OUTPUT"
+          echo "no changes between $from and $HEAD_SHA, nothing to do"
+          exit 0
+        fi
+        echo "reviewing $from..$HEAD_SHA ($(wc -l < pr.diff) diff lines)"
+
+    - name: Collect open threads
+      if: steps.range.outputs.skip != '1' && inputs.resolve-fixed == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        gh api graphql -f query='
+          query($owner: String!, $name: String!, $number: Int!) {
+            repository(owner: $owner, name: $name) {
+              pullRequest(number: $number) {
+                reviewThreads(first: 100) {
+                  nodes {
+                    id isResolved isOutdated path line
+                    comments(first: 1) { nodes { databaseId body } }
+                  }
+                }
+              }
+            }
+          }' -f owner="${REPO%/*}" -f name="${REPO#*/}" -F number="$PR_NUMBER" \
+          > threads.json 2>/dev/null || true
+
+        # only unresolved threads whose root comment carries our sentinel (never human threads)
+        jq '[ .data.repository.pullRequest.reviewThreads.nodes[]?
+              | select(.isResolved == false)
+              | (.comments.nodes[0].body // "") as $b
+              | select($b | contains("<!-- codex-review:comment -->"))
+              | { id, path, line, isOutdated,
+                  title: (($b | split("\n") | map(select(length > 0)) | .[1] // "finding") | .[0:160] | gsub("\\|"; "¦"))
+                } ]' threads.json > open-threads.json 2>/dev/null || echo '[]' > open-threads.json
+
+        count=$(jq 'length' open-threads.json)
+        echo "open threads: $count"
+        if [ "$count" != "0" ]; then
+          {
+            echo "## Open findings from previous reviews"
+            echo
+            echo "These threads are still open on this PR. Inspect the current files (the repository is"
+            echo "checked out): if a finding is already fixed in the current code, list its thread id in"
+            echo "resolved_thread_ids. Do not report these again as new findings."
+            echo
+            echo "| thread_id | path | line | outdated | finding |"
+            echo "| --- | --- | --- | --- | --- |"
+            jq -r '.[] | "| \(.id) | `\(.path)` | \(.line // "-") | \(.isOutdated) | \(.title) |"' open-threads.json
+          } > open-threads.md
+        fi
+
     - name: Run review
+      if: steps.range.outputs.skip != '1'
       shell: bash
       env:
         CODEX_REVIEW_API_KEY: ${{ inputs.api-key }}
-        BASE_REF: ${{ github.base_ref }}
       run: |
-        git diff "origin/$BASE_REF...HEAD" > pr.diff
+        {
+          cat "$GITHUB_ACTION_PATH/prompt.md"
+          if [ -s prev-review.md ]; then
+            printf '\n## Previous review of this PR (already posted as inline comments)\n\n%s\n' "$(cat prev-review.md)"
+          fi
+          if [ -s open-threads.md ]; then
+            printf '\n%s\n' "$(cat open-threads.md)"
+          fi
+        } > instructions.md
+
         codex exec --sandbox read-only \
           --output-schema "$GITHUB_ACTION_PATH/schema.json" \
           --output-last-message review.json \
-          "$(cat "$GITHUB_ACTION_PATH/prompt.md")"
+          "$(cat instructions.md)"
 
     - name: Post review
+      id: post
+      if: steps.range.outputs.skip != '1'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
@@ -90,19 +216,62 @@ runs:
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
       run: |
-        jq --arg sha "$HEAD_SHA" '
+        jq --arg sha "$HEAD_SHA" --arg marker "<!-- codex-review:head=$HEAD_SHA -->" '
           def icon: {critical:"🔴",major:"🟠",minor:"🟡",nit:"🔵"}[.];
+          def aiblock:
+            "<!-- ai-prompt:start -->\n<details>\n<summary>🤖 Prompt for AI</summary>\n\n````text\n"
+            + . + "\n````\n\n</details>\n<!-- ai-prompt:end -->";
           {
             commit_id: $sha,
             event: "COMMENT",
-            body: .summary,
+            body: ($marker + "\n\n" + .summary
+                   + (if (.ai_prompt // "") != "" then "\n\n" + ((.ai_prompt // "") | aiblock) else "" end)),
             comments: [.findings[] | {
               path, line, side: "RIGHT",
-              body: ((.severity|icon) + " **" + (.severity|ascii_upcase) + "** · " + .title
+              body: ("<!-- codex-review:comment -->\n" + (.severity|icon) + " **" + (.severity|ascii_upcase) + "** · " + .title
                      + "\n\n" + .body
-                     + (if .suggestion != "" then "\n\n```suggestion\n" + .suggestion + "\n```" else "" end))
+                     + (if (.suggestion // "") != "" then "\n\n```suggestion\n" + .suggestion + "\n```" else "" end))
             } + (if .start_line < .line then {start_line, start_side: "RIGHT"} else {} end)]
           }' review.json > payload.json
 
+        d="EOF_$RANDOM"
+        { echo "ai-prompt<<$d"; jq -r '.ai_prompt // ""' review.json; echo "$d"; } >> "$GITHUB_OUTPUT"
+
         gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --input payload.json \
           || gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(jq -r .summary review.json)"
+
+    - name: Resolve fixed threads
+      if: steps.range.outputs.skip != '1' && inputs.resolve-fixed == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+      run: |
+        [ -f review.json ] || exit 0
+        [ -f open-threads.json ] || exit 0
+
+        jq -r '.resolved_thread_ids // [] | .[]' review.json > resolved.txt
+        if [ ! -s resolved.txt ]; then
+          echo "no fixed findings to resolve"
+          exit 0
+        fi
+
+        fails=0
+        while read -r id; do
+          if ! jq -e --arg id "$id" 'any(.[]; .id == $id)' open-threads.json > /dev/null; then
+            echo "::warning::ignoring unknown thread id $id"
+            continue
+          fi
+          if gh api graphql \
+            -f query='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id isResolved } } }' \
+            -f id="$id" > /dev/null 2> resolve-err.txt; then
+            echo "resolved $id"
+          else
+            fails=$((fails + 1))
+            echo "::warning::could not resolve $id: $(head -c 200 resolve-err.txt)"
+          fi
+        done < resolved.txt
+
+        if [ "$fails" != "0" ]; then
+          echo "::warning::resolving threads needs a token with contents: write (see README)"
+        fi

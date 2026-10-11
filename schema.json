@@ -2,6 +2,11 @@
   "type": "object",
   "properties": {
     "summary": { "type": "string" },
+    "ai_prompt": { "type": "string" },
+    "resolved_thread_ids": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
     "findings": {
       "type": "array",
       "items": {
@@ -20,6 +25,6 @@
       }
     }
   },
-  "required": ["summary", "findings"],
+  "required": ["summary", "ai_prompt", "resolved_thread_ids", "findings"],
   "additionalProperties": false
 }
